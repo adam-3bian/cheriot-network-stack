@@ -427,7 +427,7 @@ namespace
 			SmallTable<int> testSmallTableZeroLength(0);
 			testSmallTableZeroLength.contains(1);
 
-      Debug::log("Testing small table pointer-based remove");
+			Debug::log("Testing small table pointer-based remove");
 			testSmallTable.insert(1);
 			testSmallTable.remove(testSmallTable.begin());
 			Debug::Assert(
@@ -586,6 +586,55 @@ namespace
 		uint16_t destinationPort;
 	} __packed;
 
+	struct TCPHeader
+	{
+		/**
+		 * Source port.
+		 */
+		uint16_t sourcePort;
+		/**
+		 * Destination port.
+		 */
+		uint16_t destinationPort;
+		/**
+		 * Sequence number.
+		 */
+		uint32_t sequenceNumber;
+		/**
+		 * Acknowledgement number.
+		 */
+		uint32_t acknowledgementNumber;
+		/**
+		 * Reserved bits, data offset, and flags.
+		 */
+		uint16_t bitfield;
+		/**
+		 * Window size.
+		 */
+		uint16_t windowSize;
+		/**
+		 * Checksum.
+		 */
+		uint16_t checksum;
+		/**
+		 * Urgent pointer.
+		 */
+		uint16_t urgentPointer;
+	} __packed;
+
+	/**
+	 * Masks to extract the value of the SYN and ACK flags in the bitfield
+	 * of a TCP header (`TCPHeader.bitfield`).
+	 *
+	 * Sequence of bits in the bitfield (in network endianness):
+	 *   dataOffset : 4
+	 *   reserved   : 4
+	 *   cwr : 1, ece : 1, urg : 1, ack : 1
+	 *   psh : 1, rst : 1, syn : 1, fin : 1
+	 */
+	static constexpr const uint16_t TCPBitfieldACKMask = 0x0010;
+	static constexpr const uint16_t TCPBitfieldSYNMask = 0x0002;
+
 	static_assert(sizeof(IPv4Header) == 20);
 
 	/**
@@ -602,7 +651,7 @@ namespace
 	class EndpointsTable
 	{
 		/**
-		 * A permitted  tuple (source and destination address and port).
+		 * A permitted tuple (source and destination address and port).
 		 *
 		 * We assume a single local address, so the local address is not stored.
 		 */
@@ -615,6 +664,7 @@ namespace
 			// = default.
 			auto operator<=>(const ConnectionTuple &) const = default; // NOLINT
 		};
+		SmallTable<uint16_t>        TCPServerPorts;
 		SmallTable<ConnectionTuple> permittedTCPEndpoints;
 		SmallTable<ConnectionTuple> permittedUDPEndpoints;
 		FlagLockPriorityInherited   permittedEndpointsLock;
@@ -662,6 +712,12 @@ namespace
 			auto &[g, table]  = guardedTable;
 			ConnectionTuple tuple{endpoint, localPort, remotePort};
 			table.remove(tuple);
+		}
+
+		void add_server_port(uint16_t localPort)
+		{
+			LockGuard g{permittedEndpointsLock};
+			TCPServerPorts.insert(localPort);
 		}
 
 		void add_endpoint(IPProtocolNumber protocol,
@@ -714,6 +770,12 @@ namespace
 			ConnectionTuple tuple{endpoint, localPort, remotePort};
 			return table.contains(tuple);
 		}
+
+		bool is_server_port(uint16_t localPort)
+		{
+			LockGuard g{permittedEndpointsLock};
+			return TCPServerPorts.contains(localPort);
+		}
 	};
 
 	bool is_dhcp_reply(enum IPProtocolNumber protocol,
@@ -735,6 +797,14 @@ namespace
 
 	uint32_t          dnsServerAddress;
 	_Atomic(uint32_t) dnsIsPermitted;
+
+	/**
+	 * `currentClientCount` keeps track of the current number of open
+	 * client connections. When `currentClientCount` reaches
+	 * `FirewallMaximumNumberOfClients`, new incoming TCP connections are
+	 * dropped. See `FirewallMaximumNumberOfClients`.
+	 */
+	_Atomic(uint8_t) currentClientCount = 0;
 
 	bool packet_filter_ipv4(const uint8_t *data,
 	                        size_t         length,
@@ -798,6 +868,51 @@ namespace
 				uint16_t localPortNumber  = tcpudpHeader->*localPort;
 				uint16_t remotePortNumber = tcpudpHeader->*remotePort;
 				bool isIngress = (remoteAddress == &IPv4Header::sourceAddress);
+				// First SYN to a local server port should
+				// trigger creation of a firewall entry.
+				if ((isIngress) &&
+				    (ipv4Header->protocol == IPProtocolNumber::TCP) &&
+				    (EndpointsTable<uint32_t>::instance().is_server_port(
+				      localPortNumber)))
+				{
+					if (ipv4Header->body_offset() + sizeof(TCPHeader) > length)
+					{
+						Debug::log("Dropping truncated TCP packet of length {}",
+						           length);
+						return false;
+					}
+					auto *tcpHeader =
+					  reinterpret_cast<const TCPHeader *>(tcpudpHeader);
+					if (((ntohs(tcpHeader->bitfield) & TCPBitfieldSYNMask) !=
+					     0) &&
+					    ((ntohs(tcpHeader->bitfield) & TCPBitfieldACKMask) ==
+					     0))
+					{
+						if (currentClientCount + 1 >=
+						    FirewallMaximumNumberOfClients)
+						{
+							// Maximum number of client connections
+							// reached.
+							Debug::log("Maximum number of clients reached, "
+							           "dropping TCP SYN");
+							return false;
+						}
+						currentClientCount++;
+						Debug::log("Permitting new client TCP connection from "
+						           "{}.{}.{}.{}",
+						           static_cast<int>(endpoint) & 0xff,
+						           static_cast<int>(endpoint >> 8) & 0xff,
+						           static_cast<int>(endpoint >> 16) & 0xff,
+						           static_cast<int>(endpoint >> 24) & 0xff);
+						EndpointsTable<uint32_t>::instance().add_endpoint(
+						  IPProtocolNumber::TCP,
+						  endpoint,
+						  localPortNumber,
+						  remotePortNumber);
+						return true;
+					}
+				}
+				// Otherwise look up the table
 				if (EndpointsTable<uint32_t>::instance().is_endpoint_permitted(
 				      ipv4Header->protocol,
 				      endpoint,
@@ -1015,6 +1130,11 @@ void firewall_permit_dns(bool dnsIsPermitted)
 	::dnsIsPermitted += dnsIsPermitted ? 1 : -1;
 }
 
+void firewall_add_tcpipv4_server_port(uint16_t localPort)
+{
+	EndpointsTable<uint32_t>::instance().add_server_port(localPort);
+}
+
 void firewall_add_tcpipv4_endpoint(uint32_t remoteAddress,
                                    uint16_t localPort,
                                    uint16_t remotePort)
@@ -1035,6 +1155,10 @@ void firewall_remove_tcpipv4_endpoint(uint16_t localPort)
 {
 	EndpointsTable<uint32_t>::instance().remove_endpoint(IPProtocolNumber::TCP,
 	                                                     localPort);
+	if (EndpointsTable<uint32_t>::instance().is_server_port(localPort))
+	{
+		currentClientCount--;
+	}
 }
 
 void firewall_remove_udpipv4_local_endpoint(uint16_t localPort)
@@ -1105,6 +1229,11 @@ namespace
 } // namespace
 
 #if CHERIOT_RTOS_OPTION_IPv6
+void firewall_add_tcpipv6_server_port(uint16_t localPort)
+{
+	EndpointsTable<IPv6Address>::instance().add_server_port(localPort);
+}
+
 void firewall_add_tcpipv6_endpoint(uint8_t *remoteAddress,
                                    uint16_t localPort,
                                    uint16_t remotePort)
@@ -1131,6 +1260,10 @@ void firewall_remove_tcpipv6_endpoint(uint16_t localPort)
 {
 	EndpointsTable<IPv6Address>::instance().remove_endpoint(
 	  IPProtocolNumber::TCP, localPort);
+	if (EndpointsTable<IPv6Address>::instance().is_server_port(localPort))
+	{
+		currentClientCount--;
+	}
 }
 
 void firewall_remove_udpipv6_local_endpoint(uint16_t localPort)

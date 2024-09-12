@@ -34,6 +34,17 @@ bool __cheri_compartment("Firewall")
 static constexpr uint32_t RestartStateDriverKickedBit = 0x4;
 
 /**
+ * Each new TCP connection to a local server port causes the creation of a
+ * firewall entry.  To prevent this mechanism from being abused by remote
+ * attackers to DoS the system (the creation of firewall hole may cause an
+ * allocation to enlarge the table), the maximum number of concurrent TCP
+ * connections is limited to `MaxClientCount`.
+ *
+ * When this maximum is reached, new incoming TCP connections are dropped.
+ */
+static constexpr const uint8_t FirewallMaximumNumberOfClients = 6;
+
+/**
  * Query the link status of the Firewall driver.  This returns true if the link
  * is up, false otherwise.
  */
@@ -59,6 +70,27 @@ void __cheri_compartment("Firewall") firewall_dns_server_ip_set(uint32_t ip);
  */
 void __cheri_compartment("Firewall")
   firewall_permit_dns(bool dnsIsPermitted = true);
+
+/**
+ * Register a local TCP port as server port.
+ *
+ * Any new incoming TCP connection to that port will trigger the creation of a
+ * hole in the firewall for TCP packets from that endpoint and port to the
+ * local TCP server port.
+ *
+ * New TCP client connections are identified by incoming TCP SYN packets.
+ *
+ * To prevent this mechanism from being used as a vector for DoS (since the
+ * creation of firewall hole may cause an allocation to enlarge the table), the
+ * maximum number of concurrent TCP connections is limited (see
+ * `MaxClientCount` in `firewall.cc`). Past that point, new incoming TCP
+ * connections will be dropped until a slot is freed (through a connection
+ * being terminated).
+ *
+ * This should be called only by the NetAPI compartment.
+ */
+void __cheri_compartment("Firewall")
+  firewall_add_tcpipv4_server_port(uint16_t localPort);
 
 /**
  * Open a hole in the firewall for TCP packets to and from the given endpoint.
@@ -116,6 +148,20 @@ void __cheri_compartment("Firewall")
 
 #if CHERIOT_RTOS_OPTION_IPv6
 /**
+ * Register a local TCP port as server port.
+ *
+ * Any new incoming TCP connection to that port will trigger the creation of a
+ * hole in the firewall for TCP packets from that endpoint and port to the
+ * local TCP server port.
+ *
+ * See `firewall_add_tcpipv4_server_port` for more information.
+ *
+ * This should be called only by the NetAPI compartment.
+ */
+void __cheri_compartment("Firewall")
+  firewall_add_tcpipv6_server_port(uint16_t localPort);
+
+/**
  * Open a hole in the firewall for TCP packets to and from the given endpoint.
  * This permits inbound packets to, and outbound packets from, the specified
  * local port, if the remote endpoint is the given remote address and port.
@@ -169,6 +215,13 @@ void __cheri_compartment("Firewall")
                                           uint16_t localPort,
                                           uint16_t remotePort);
 #else
+__always_inline static inline void
+  firewall_add_tcpipv6_server_port(uint16_t localPort)
+{
+	Debug::Assert(
+	  false, "{} not supported with IPv6 disabled", __PRETTY_FUNCTION__);
+}
+
 __always_inline static inline void
 firewall_add_tcpipv6_endpoint(uint8_t *remoteAddress,
                               uint16_t localPort,
