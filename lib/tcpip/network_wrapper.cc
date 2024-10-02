@@ -17,6 +17,7 @@
 #include <locks.hh>
 #include <platform-ethernet.hh>
 #include <token.h>
+#include <endianness.h>
 
 using Debug = ConditionalDebug<false, "Network stack wrapper">;
 
@@ -73,28 +74,6 @@ using CHERI::PermissionSet;
 
 namespace
 {
-	// TODO These should probably be in their own library.
-	uint16_t constexpr ntohs(uint16_t value)
-	{
-		return
-#ifdef __LITTLE_ENDIAN__
-		  __builtin_bswap16(value)
-#else
-		  value
-#endif
-		    ;
-	}
-	uint16_t constexpr htons(uint16_t value)
-	{
-		return
-#ifdef __LITTLE_ENDIAN__
-		  __builtin_bswap16(value)
-#else
-		  value
-#endif
-		    ;
-	}
-
 	/**
 	 * Returns the key with which SealedSocket instances are sealed.
 	 */

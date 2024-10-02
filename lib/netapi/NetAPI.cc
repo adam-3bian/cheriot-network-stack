@@ -7,22 +7,11 @@
 #include <atomic>
 #include <debug.hh>
 #include <token.h>
+#include <endianness.h>
 
 using Debug = ConditionalDebug<false, "Network API">;
 
 #include "../firewall/firewall.hh"
-
-namespace
-{
-	uint16_t ntohs(uint16_t value)
-	{
-		return __builtin_bswap16(value);
-	}
-	uint16_t htons(uint16_t value)
-	{
-		return __builtin_bswap16(value);
-	}
-} // namespace
 
 namespace
 {
